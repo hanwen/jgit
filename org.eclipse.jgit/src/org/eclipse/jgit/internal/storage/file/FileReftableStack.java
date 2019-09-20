@@ -427,7 +427,7 @@ class FileReftableStack implements AutoCloseable {
 					stack.get(first).reftableReader.minUpdateIndex(),
 					stack.get(last).reftableReader.maxUpdateIndex());
 
-			// XXX .log ?
+			// The spec suggests to use .log for log-only tables, but there seems to be no good reason for this.
 			fn += ".ref"; //$NON-NLS-1$
 			File dest = new File(reftableDir, fn);
 

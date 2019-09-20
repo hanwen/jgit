@@ -360,7 +360,6 @@ public class FileReftableTest extends SampleDataRepositoryTestCase {
 		assertEquals(ObjectId.zeroId(), entry1.getOldId());
 		assertEquals(r.getObjectId(), entry1.getNewId());
 
-		// XXX something with timezones.
 		assertEquals(new PersonIdent(db).toString(),
 				entry1.getWho().toString());
 		assertEquals("", entry1.getComment());
@@ -401,7 +400,6 @@ public class FileReftableTest extends SampleDataRepositoryTestCase {
 	@Test
 	public void writeUnbornHead() throws Exception {
 		RefUpdate.Result r = db.updateRef("HEAD").link("refs/heads/unborn");
-		// XXX what should this be?
 		assertEquals(FORCED, r);
 
 		Ref head = db.exactRef("HEAD");

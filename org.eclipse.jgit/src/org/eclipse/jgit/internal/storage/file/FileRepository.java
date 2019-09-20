@@ -709,7 +709,6 @@ public class FileRepository extends Repository {
 			throw new IOException("reftable dir exists and is nonempty");
 		}
 
-		// XXX check that refable/ is empty.
 		FileReftableDatabase.convertFrom(this, newRefs, writeLogs);
 
 		File refsFile = new File(getDirectory(), "refs");
