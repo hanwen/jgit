@@ -52,11 +52,15 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.text.MessageFormat;
 import java.text.ParseException;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Collectors;
 
+import com.sun.xml.internal.bind.v2.runtime.reflect.opt.Const;
 import org.eclipse.jgit.annotations.Nullable;
 import org.eclipse.jgit.api.errors.JGitInternalException;
 import org.eclipse.jgit.attributes.AttributesNode;
@@ -68,10 +72,12 @@ import org.eclipse.jgit.internal.storage.file.ObjectDirectory.AlternateHandle;
 import org.eclipse.jgit.internal.storage.file.ObjectDirectory.AlternateRepository;
 import org.eclipse.jgit.internal.storage.reftree.RefTreeDatabase;
 import org.eclipse.jgit.lib.BaseRepositoryBuilder;
+import org.eclipse.jgit.lib.BatchRefUpdate;
 import org.eclipse.jgit.lib.ConfigConstants;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.CoreConfig.HideDotFiles;
 import org.eclipse.jgit.lib.CoreConfig.SymLinks;
+import org.eclipse.jgit.lib.NullProgressMonitor;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ProgressMonitor;
 import org.eclipse.jgit.lib.Ref;
@@ -80,9 +86,11 @@ import org.eclipse.jgit.lib.RefUpdate;
 import org.eclipse.jgit.lib.ReflogReader;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.lib.StoredConfig;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.storage.file.FileBasedConfig;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 import org.eclipse.jgit.storage.pack.PackConfig;
+import org.eclipse.jgit.transport.ReceiveCommand;
 import org.eclipse.jgit.util.FileUtils;
 import org.eclipse.jgit.util.IO;
 import org.eclipse.jgit.util.RawParseUtils;
@@ -628,26 +636,115 @@ public class FileRepository extends Repository {
 	}
 
 	/**
-	 * Converts the RefDatabase to use reftable for storage. The old refs are
+	 * Converts the RefDatabase from reftable to RefDirectory.. The old refs are
 	 * left in refs.old/ directory
 	 *
-	 * @param writeLogs
-	 *            whether to write reflogs
 	 * @throws IOException
 	 *             on IO problem
 	 */
 	@SuppressWarnings("nls")
-	public void convertToReftable(boolean writeLogs) throws IOException {
-		File newRefs = new File(getDirectory(), "refs.new");
+	void convertToPackedRefs() throws IOException {
+		File packedRefs = new File(getDirectory(), Constants.PACKED_REFS);
+		if (packedRefs.exists()) {
+			throw new IOException("packed-refs already exists");
+		}
 
+		List<Ref> all = refs.getRefs();
+		File refsOld = new File(getDirectory(), "refs.old");
+		if (refsOld.exists()) {
+			throw new IOException("refs.old already exists");
+		}
+
+		File refsFile = new File(getDirectory(), "refs");
+		refs.close();
+		FileUtils.rename(refsFile, refsOld);
+
+		// This is not atomic, but there is no way to instantiate a RefDirectory that is
+		// is disconnected from the current repo.
+		refs = new RefDirectory(this);
+		refs.create();
+
+		List<Ref> symrefs = new ArrayList<>();
+		BatchRefUpdate bru = refs.newBatchUpdate();
+		for (Ref r : all) {
+			if (r.isSymbolic()) {
+				symrefs.add(r);
+			} else {
+				bru.addCommand(new ReceiveCommand(ObjectId.zeroId(), r.getObjectId(), r.getName()));
+			}
+		}
+
+		try (RevWalk rw =new RevWalk(this)) {
+			bru.execute(rw, NullProgressMonitor.INSTANCE);
+		}
+
+		List<String> failed = new ArrayList<>();
+		for (ReceiveCommand cmd : bru.getCommands()) {
+			if (cmd.getResult() != ReceiveCommand.Result.OK) {
+				failed.add(cmd.getRefName() + ": " + cmd.getResult());
+			}
+		}
+
+		if (!failed.isEmpty()) {
+			throw new IOException(String.format("failed to convert rest: %s", StringUtils.join(failed, ", ")));
+		}
+
+
+		for (Ref s : symrefs) {
+			RefUpdate up = refs.newUpdate(s.getName(),false);
+			up.setForceUpdate(true);
+			RefUpdate.Result res = up.link(s.getTarget().getName());
+			if (res != RefUpdate.Result.NEW && res != RefUpdate.Result.NO_CHANGE) {
+				throw new IOException(String.format("ref %s: %s", s.getName(), res));
+			}
+		}
+	}
+
+	@SuppressWarnings("nls")
+	void convertToReftable(boolean writeLogs) throws IOException {
+		File newRefs = new File(getDirectory(), "refs.new");
+		File reftableDir = new File(getDirectory(), Constants.REFTABLE);
+
+		if (reftableDir.exists() && reftableDir.listFiles().length > 0) {
+			throw new IOException("reftable dir exists and is nonempty");
+		}
+
+		// XXX check that refable/ is empty.
 		FileReftableDatabase.convertFrom(this, newRefs, writeLogs);
 
 		File refsFile = new File(getDirectory(), "refs");
 
-		// non-atomic.
+		// non-atomic: remove old data.
 		FileUtils.rename(refsFile, new File(getDirectory(), "refs.old"));
+		File packedRefs = new File(getDirectory(), Constants.PACKED_REFS);
+		if (packedRefs.exists()) {
+			FileUtils.rename(packedRefs, new File(getDirectory(), Constants.PACKED_REFS + ".old"));
+		}
+		File logsDir = new File(getDirectory(), Constants.LOGS);
+		if (logsDir.exists()) {
+			FileUtils.rename(logsDir, new File(getDirectory(), Constants.LOGS + ".old"));
+		}
+
+		// Put new data.
 		FileUtils.rename(newRefs, refsFile);
+
+
 		refs.close();
 		refs = new FileReftableDatabase(this, refsFile);
+	}
+
+	@SuppressWarnings("nls")
+	public void convertRefStorage(String format, boolean writeLogs) throws IOException {
+		if (format.equals("reftable")) {
+			if (refs instanceof RefDirectory) {
+				convertToReftable(writeLogs);
+			}
+		} else if (format.equals("refdir")) {
+			if (refs instanceof FileReftableDatabase) {
+				convertToPackedRefs();
+			}
+		} else {
+			throw new IOException(String.format("unknown supported ref storage format '%s'", format));
+		}
 	}
 }

@@ -104,6 +104,21 @@ public class FileReftableTest extends SampleDataRepositoryTestCase {
 	}
 
 	@Test
+	public void testConvertToRefdir() throws Exception {
+		db.convertToPackedRefs();
+		assertTrue(db.getRefDatabase() instanceof RefDirectory);
+		Ref h = db.exactRef("HEAD");
+		assertTrue(h.isSymbolic());
+		assertEquals("refs/heads/master", h.getTarget().getName());
+
+		Ref b = db.exactRef("refs/heads/b");
+		assertFalse(b.isSymbolic());
+		assertTrue(b.isPeeled());
+		assertEquals("7f822839a2fe9760f386cbbbcb3f92c5fe81def7",
+				b.getObjectId().name());
+	}
+
+	@Test
 	public void testBatchrefUpdate() throws Exception {
 		ObjectId cur = db.resolve("master");
 		ObjectId prev = db.resolve("master^");
