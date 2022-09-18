@@ -12,8 +12,11 @@ package org.eclipse.jgit.internal.storage.dfs;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import java.util.Collections;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantLock;
 
+import org.eclipse.jgit.internal.storage.pack.PackExt;
 import org.eclipse.jgit.junit.TestRepository;
 import org.eclipse.jgit.lib.ObjectIdRef;
 import org.eclipse.jgit.lib.Ref;
@@ -113,5 +116,39 @@ public class InMemoryRepositoryTest {
 			assertEquals(ref.getName(), "refs/tags/v0.2");
 			assertEquals(commit.getId(), ref.getObjectId());
 		}
+	}
+
+	@Test
+	public void onlineCompaction() throws Exception {
+		InMemoryRepository repo = new InMemoryRepository(
+				new DfsRepositoryDescription());
+
+		/* quick & dirty benchmark. With 4000 iterations, online log
+		   compaction is 4x faster than previous strategy. */
+		boolean benchmark = false;
+		long start = System.nanoTime();
+		try (TestRepository<InMemoryRepository> git = new TestRepository<>(
+				repo)) {
+			for (int i = 0; i < 128; i++) {
+				RevCommit commit = git.commit().message("commit no " + i).create();
+				/* Must have at least 2 refs per
+				   block, or the reftable code barfs
+				   trying to write the index. */
+				git.update("refs/branch" + i + String.join("", Collections.nCopies(2000, "x")), commit);
+				if (!benchmark) {
+					int count = 0;
+					for (DfsPackDescription desc : repo.getObjectDatabase().listPacks()) {
+						if (desc.hasFileExt(PackExt.REFTABLE)) count++;
+					}
+					// 128 refs of size 1/2 block = 64 blocks = 2^6.
+					// Maximum config is 5 reftables, corresponding to
+					// one table of 2^5 blocks, one of 2^4 etc. */
+					assertTrue(count < 6);
+				}
+			}
+		}
+		long end = System.nanoTime();
+		if (benchmark)
+		  System.err.println("dt = " + (end - start));
 	}
 }

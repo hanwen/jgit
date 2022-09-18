@@ -26,6 +26,8 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -60,28 +62,18 @@ public class DfsReftableBatchRefUpdate extends ReftableBatchRefUpdate {
 	@Override
 	protected void applyUpdates(List<Ref> newRefs, List<ReceiveCommand> pending)
 			throws IOException {
-		Set<DfsPackDescription> prune = Collections.emptySet();
+		Set<DfsPackDescription> prune = new HashSet<>();
 		DfsPackDescription pack = odb.newPack(PackSource.INSERT);
 		try (DfsOutputStream out = odb.writeFile(pack, REFTABLE)) {
 			ReftableConfig cfg = DfsPackCompactor
 					.configureReftable(refdb.getReftableConfig(), out);
 
 			ReftableWriter.Stats stats;
-			if (refdb.compactDuringCommit()
-					&& newRefs.size() * AVG_BYTES <= cfg.getRefBlockSize()
-					&& canCompactTopOfStack(cfg)) {
-				ByteArrayOutputStream tmp = new ByteArrayOutputStream();
-				ReftableWriter rw = new ReftableWriter(cfg, tmp);
-				write(rw, newRefs, pending);
-				rw.finish();
-				stats = compactTopOfStack(out, cfg, tmp.toByteArray());
-				prune = toPruneTopOfStack();
-			} else {
-				ReftableWriter rw = new ReftableWriter(cfg, out);
-				write(rw, newRefs, pending);
-				rw.finish();
-				stats = rw.getStats();
-			}
+			ByteArrayOutputStream tmp = new ByteArrayOutputStream();
+			ReftableWriter rw = new ReftableWriter(cfg, tmp);
+			write(rw, newRefs, pending);
+			rw.finish();
+			stats = compactTopOfStack(out, cfg, tmp.toByteArray(), rw.getStats(), prune);
 			pack.addFileExt(REFTABLE);
 			pack.setReftableStats(stats);
 		}
@@ -117,16 +109,64 @@ public class DfsReftableBatchRefUpdate extends ReftableBatchRefUpdate {
 		}
 	}
 
+	final static int OVERHEAD = 91;
+	private int log2(long sz) {
+		int l = 0;
+		while (sz > 0) {
+			l++;
+			sz /= 2;
+		}
+		return l;
+	}
+
 	private ReftableWriter.Stats compactTopOfStack(OutputStream out,
-			ReftableConfig cfg, byte[] newTable) throws IOException {
+			ReftableConfig cfg, byte[] newTable, ReftableWriter.Stats newStats, Set<DfsPackDescription> toPrune) throws IOException {
+
 		refdb.getLock().lock();
 		try {
-			List<ReftableReader> stack = refdb.stack().readers();
+			DfsReftableStack dfsReftableStack = refdb.stack();
+			List<ReftableReader> stack = dfsReftableStack.readers();
 
-			ReftableReader last = stack.get(stack.size() - 1);
+			/* Try to find a tail section that (if compacted) yields a larger log2 size.
+			 * This means that for each compaction step, each ref is in a differently sized table (in terms of log2)
+			 * limiting total work to O(#refs * log2(#refs)). (It's probably linear, but too lazy to prove it.)
+			 */
+			long cumulative_size = 0;
+			long max_log2 = 0;
+			int compact_segment_start = stack.size();
+			for (int i = stack.size(); i >= 0; i--) {
+				if (!refdb.compactDuringCommit())
+					break;
 
-			List<ReftableReader> tables = new ArrayList<>(2);
-			tables.add(last);
+				long sz;
+				if (i == stack.size()) {
+					sz = newTable.length;
+				} else if (!packOnlyContainsReftable(dfsReftableStack.files().get(i).desc)) {
+					// NOSUBMIT - what about INSERT packtype?
+					break;
+				} else {
+					sz = stack.get(i).size();
+				}
+				sz -= OVERHEAD;
+				cumulative_size += sz;
+				if (log2(sz) > max_log2) {
+					max_log2 = log2(sz);
+				}
+				// NOSUBMIT - should we also compact if cumulative_size < blocksize ?
+				if (log2(cumulative_size) > max_log2) {
+					compact_segment_start = i;
+				}
+			}
+
+			if (compact_segment_start == stack.size()) {
+				out.write(newTable);
+				return newStats;
+			}
+			List<ReftableReader> tables = new ArrayList<>();
+			for (int i = compact_segment_start; i < stack.size(); i++) {
+				tables.add(stack.get(i));
+				toPrune.add(dfsReftableStack.files().get(i).desc);
+			}
 			tables.add(new ReftableReader(BlockSource.from(newTable)));
 
 			ReftableCompactor compactor = new ReftableCompactor(out);
@@ -135,18 +175,6 @@ public class DfsReftableBatchRefUpdate extends ReftableBatchRefUpdate {
 			compactor.addAll(tables);
 			compactor.compact();
 			return compactor.getStats();
-		} finally {
-			refdb.getLock().unlock();
-		}
-	}
-
-	private Set<DfsPackDescription> toPruneTopOfStack() throws IOException {
-		refdb.getLock().lock();
-		try {
-			List<DfsReftable> stack = refdb.stack().files();
-
-			DfsReftable last = stack.get(stack.size() - 1);
-			return Collections.singleton(last.getPackDescription());
 		} finally {
 			refdb.getLock().unlock();
 		}
